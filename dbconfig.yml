@@ -1,0 +1,4 @@
+development:
+  dialect: postgres
+  datasource: user=postgres password=AS28nov97 dbname=gosentry sslmode=disable
+  dir: migrations
