@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"goSentry/controllers/users/models"
-	"goSentry/database"
+	"log"
 
 	"github.com/getsentry/sentry-go"
 	"github.com/gofiber/fiber/v2"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"gorm.io/gorm"
 )
 
@@ -62,7 +65,7 @@ func CreateUser(c *fiber.Ctx, db *gorm.DB) error {
 			"message": "Username and Email are required",
 		})
 	}
-	if err := database.DB.WithContext(c.UserContext()).Create(&user).Error; err != nil {
+	if err := db.WithContext(c.UserContext()).Create(&user).Error; err != nil {
 		sentry.CaptureException(err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"message": "Failed to create user",
@@ -75,27 +78,113 @@ func CreateUser(c *fiber.Ctx, db *gorm.DB) error {
 }
 
 func CreateUser2(ctx context.Context, db *gorm.DB, user models.Users) error {
+	// Use OpenTelemetry Tracer to explicitly create a span
+	tracer := otel.Tracer("goSentry/users")
+	// Ensure the span is a child of the incoming context (from Fiber middleware)
+	ctx, span := tracer.Start(ctx, "db.insert", trace.WithSpanKind(trace.SpanKindClient))
+	defer span.End()
 
+	spanCtx := trace.SpanContextFromContext(ctx)
+	log.Printf("CreateUser2 (OTel) - TraceID: %s, SpanID: %s\n", spanCtx.TraceID().String(), spanCtx.SpanID().String())
+
+	// Add attributes to the span
+	span.SetAttributes(
+		attribute.String("db.operation", "INSERT"),
+		attribute.String("db.table", "users"),
+		attribute.String("user.username", user.Username),
+		attribute.String("user.email", user.Email),
+	)
+
+	// Create child span for validation
+	ctx, validationSpan := tracer.Start(ctx, "validation", trace.WithSpanKind(trace.SpanKindInternal))
 	if user.Username == "" || user.Email == "" {
+		validationSpan.SetAttributes(
+			attribute.String("validation.error", "missing_required_fields"),
+			attribute.Bool("validation.success", false),
+		)
+		validationSpan.End()
+		sentry.CaptureMessage("Username and Email are required for user creation")
 		return fmt.Errorf("username and email are required")
 	}
+	validationSpan.SetAttributes(attribute.Bool("validation.success", true))
+	validationSpan.End()
 
-	if err := db.WithContext(ctx).Create(user).Error; err != nil {
+	// Create child span for database operation
+	ctx, dbSpan := tracer.Start(ctx, "db.create", trace.WithSpanKind(trace.SpanKindClient))
+	dbSpan.SetAttributes(
+		attribute.String("db.system", "postgresql"),
+		attribute.String("db.operation", "CREATE"),
+		attribute.String("db.table", "users"),
+	)
+
+	if err := db.WithContext(ctx).Create(&user).Error; err != nil {
+		dbSpan.SetAttributes(
+			attribute.String("db.error", err.Error()),
+			attribute.Bool("db.success", false),
+		)
+		dbSpan.End()
 		sentry.CaptureException(err)
 		return fmt.Errorf("failed to create user: %w", err)
 	}
 
+	dbSpan.SetAttributes(
+		attribute.Bool("db.success", true),
+		attribute.Int("db.rows_affected", 1),
+	)
+	dbSpan.End()
+
 	return nil
 }
 
-// GetUsers devolve o slice ou erro; não sabe nada de HTTP.
 func GetUsers2(ctx context.Context, db *gorm.DB) ([]models.Users, error) {
-    var users []models.Users
+	// Use OpenTelemetry Tracer to explicitly create a span
+	tracer := otel.Tracer("goSentry/users")
+	// Ensure the span is a child of the incoming context (from Fiber middleware)
+	ctx, span := tracer.Start(ctx, "db.query", trace.WithSpanKind(trace.SpanKindClient))
+	defer span.End()
 
-    if err := db.WithContext(ctx).Find(&users).Error; err != nil {
-        sentry.CaptureException(err) // mantém trace no Sentry
-        return nil, fmt.Errorf("failed to fetch users: %w", err)
-    }
+	spanCtx := trace.SpanContextFromContext(ctx)
+	log.Printf("GetUsers2 (OTel) - TraceID: %s, SpanID: %s\n", spanCtx.TraceID().String(), spanCtx.SpanID().String())
 
-    return users, nil
+	// Add attributes to the span
+	span.SetAttributes(
+		attribute.String("db.operation", "SELECT"),
+		attribute.String("db.table", "users"),
+		attribute.String("db.system", "postgresql"),
+	)
+
+	// Create child span for database query
+	ctx, dbSpan := tracer.Start(ctx, "db.find", trace.WithSpanKind(trace.SpanKindClient))
+	dbSpan.SetAttributes(
+		attribute.String("db.query", "SELECT * FROM users"),
+		attribute.String("db.operation", "FIND"),
+	)
+
+	var users []models.Users
+
+	if err := db.WithContext(ctx).Find(&users).Error; err != nil {
+		dbSpan.SetAttributes(
+			attribute.String("db.error", err.Error()),
+			attribute.Bool("db.success", false),
+		)
+		dbSpan.End()
+		sentry.CaptureException(err)
+		return nil, fmt.Errorf("failed to fetch users: %w", err)
+	}
+
+	dbSpan.SetAttributes(
+		attribute.Bool("db.success", true),
+		attribute.Int("db.rows_returned", len(users)),
+	)
+	dbSpan.End()
+
+	// Create child span for data processing
+	ctx, processSpan := tracer.Start(ctx, "data.processing", trace.WithSpanKind(trace.SpanKindInternal))
+	processSpan.SetAttributes(
+		attribute.Int("users.count", len(users)),
+		attribute.Bool("processing.success", true),
+	)
+	processSpan.End()
+
+	return users, nil
 }

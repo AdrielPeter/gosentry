@@ -13,7 +13,9 @@ import (
 	sentryotel "github.com/getsentry/sentry-go/otel"
 	"github.com/gofiber/fiber/v2"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	otelfiber "github.com/gofiber/contrib/otelfiber/v2"
 
@@ -29,6 +31,7 @@ func main() {
 		EnableTracing:    true,
 		TracesSampleRate: 1.0,
 		SendDefaultPII:   true,
+		Debug:            true,
 	}); err != nil {
 		log.Fatalf("sentry.Init: %v", err)
 	}
@@ -48,75 +51,156 @@ func main() {
 
 	app := fiber.New()
 
-	// Use o middleware Sentry Fiber
+	// Use o middleware OpenTelemetry Fiber primeiro
+	app.Use(otelfiber.Middleware())
+
+	// Em seguida, use o middleware Sentry Fiber
 	app.Use(sentryfiber.New(sentryfiber.Options{
 		Repanic:         true,
 		WaitForDelivery: true,
 		Timeout:         2 * time.Second,
 	}))
 
-	app.Use(otelfiber.Middleware())
-
 	// Rota para criar um novo usuário
 	app.Post("/users", func(c *fiber.Ctx) error {
+		spanCtx := oteltrace.SpanContextFromContext(c.UserContext())
+		log.Printf("Handler POST /users - OTel TraceID: %s, SpanID: %s\n", spanCtx.TraceID().String(), spanCtx.SpanID().String())
+
+		// Create child span for request parsing
+		tracer := otel.Tracer("goSentry/handlers")
+		ctx, parseSpan := tracer.Start(c.UserContext(), "request.parsing", oteltrace.WithSpanKind(oteltrace.SpanKindInternal))
+		parseSpan.SetAttributes(
+			attribute.String("http.method", "POST"),
+			attribute.String("http.route", "/users"),
+			attribute.String("http.url", c.OriginalURL()),
+		)
+
 		var newUser usersModel.Users // Struct para receber os dados do corpo da requisição
 
 		// Faz o parsing do corpo da requisição para a struct newUser
 		if err := c.BodyParser(&newUser); err != nil {
+			parseSpan.SetAttributes(
+				attribute.String("parsing.error", err.Error()),
+				attribute.Bool("parsing.success", false),
+			)
+			parseSpan.End()
 			log.Printf("Error parsing request body: %v", err)
 			sentry.CaptureException(err) // Captura o erro no Sentry
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"message": "Invalid request body",
+				"message":  "Invalid request body",
+				"trace_id": spanCtx.TraceID().String(),
+				"span_id":  spanCtx.SpanID().String(),
 			})
 		}
+		parseSpan.SetAttributes(attribute.Bool("parsing.success", true))
+		parseSpan.End()
+
+		// Create child span for validation
+		ctx, validationSpan := tracer.Start(ctx, "request.validation", oteltrace.WithSpanKind(oteltrace.SpanKindInternal))
+		validationSpan.SetAttributes(
+			attribute.String("user.username", newUser.Username),
+			attribute.String("user.email", newUser.Email),
+		)
 
 		// Validação básica dos campos (apenas Username e Email)
 		if newUser.Username == "" || newUser.Email == "" {
+			validationSpan.SetAttributes(
+				attribute.String("validation.error", "missing_required_fields"),
+				attribute.Bool("validation.success", false),
+			)
+			validationSpan.End()
 			log.Println("Username and Email are required")
 			sentry.CaptureMessage("Missing required fields for user creation")
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"message": "Username and Email are required",
+				"message":  "Username and Email are required",
+				"trace_id": spanCtx.TraceID().String(),
+				"span_id":  spanCtx.SpanID().String(),
 			})
 		}
+		validationSpan.SetAttributes(attribute.Bool("validation.success", true))
+		validationSpan.End()
 
-		// Chama a função CreateUser, passando o contexto da requisição, a instância do DB
+		// Create child span for user creation
+		ctx, createSpan := tracer.Start(ctx, "user.creation", oteltrace.WithSpanKind(oteltrace.SpanKindInternal))
+
+		// Chama a função CreateUser2, passando o contexto da requisição, a instância do DB
 		// e a struct newUser com os dados já parseados.
-		if err := users.CreateUser2(c.UserContext(), database.DB, newUser); err != nil {
+		if err := users.CreateUser2(ctx, database.DB, newUser); err != nil {
+			createSpan.SetAttributes(
+				attribute.String("creation.error", err.Error()),
+				attribute.Bool("creation.success", false),
+			)
+			createSpan.End()
 			// O erro já foi capturado dentro de users.CreateUser se for um erro de DB
 			// ou você pode capturar erros específicos aqui se a função retornar erros de validação
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"message": "Failed to create user",
+				"message":  "Failed to create user",
+				"trace_id": spanCtx.TraceID().String(),
+				"span_id":  spanCtx.SpanID().String(),
 			})
 		}
 
+		createSpan.SetAttributes(attribute.Bool("creation.success", true))
+		createSpan.End()
+
 		log.Println("User created successfully")
 		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
-			"message": "User created successfully",
-			"data":    newUser, // Retorna os dados do usuário criado
+			"message":  "User created successfully",
+			"data":     newUser, // Retorna os dados do usuário criado
+			"trace_id": spanCtx.TraceID().String(),
+			"span_id":  spanCtx.SpanID().String(),
 		})
 	})
 
-	// routes.go ou no main, logo depois de criar o app e injetar o DB
+	// Rota para listar usuários
 	app.Get("/users", func(c *fiber.Ctx) error {
-		// 1. Busca no banco usando o contexto da requisição (para manter o trace)
-		list, err := users.GetUsers2(c.UserContext(), database.DB)
+		spanCtx := oteltrace.SpanContextFromContext(c.UserContext())
+		log.Printf("Handler GET /users - OTel TraceID: %s, SpanID: %s\n", spanCtx.TraceID().String(), spanCtx.SpanID().String())
+
+		// Create child span for user retrieval
+		tracer := otel.Tracer("goSentry/handlers")
+		ctx, retrieveSpan := tracer.Start(c.UserContext(), "user.retrieval", oteltrace.WithSpanKind(oteltrace.SpanKindInternal))
+		retrieveSpan.SetAttributes(
+			attribute.String("http.method", "GET"),
+			attribute.String("http.route", "/users"),
+			attribute.String("http.url", c.OriginalURL()),
+		)
+
+		list, err := users.GetUsers2(ctx, database.DB)
 		if err != nil {
-			// já está logado/CaptureException lá dentro; aqui só devolvemos HTTP 500
-			return fiber.NewError(fiber.StatusInternalServerError, "failed to fetch users")
+			retrieveSpan.SetAttributes(
+				attribute.String("retrieval.error", err.Error()),
+				attribute.Bool("retrieval.success", false),
+			)
+			retrieveSpan.End()
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"message":  "failed to fetch users",
+				"trace_id": spanCtx.TraceID().String(),
+				"span_id":  spanCtx.SpanID().String(),
+			})
 		}
 
-		// 2. Nenhum registro encontrado → HTTP 404
+		retrieveSpan.SetAttributes(
+			attribute.Bool("retrieval.success", true),
+			attribute.Int("users.count", len(list)),
+		)
+		retrieveSpan.End()
+
 		if len(list) == 0 {
-			return fiber.NewError(fiber.StatusNotFound, "no users found")
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"message":  "no users found",
+				"trace_id": spanCtx.TraceID().String(),
+				"span_id":  spanCtx.SpanID().String(),
+			})
 		}
 
-		// 3. Sucesso → HTTP 200
 		return c.Status(fiber.StatusOK).JSON(fiber.Map{
-			"message": "users found",
-			"data":    list, // slice retornado pelo use-case
+			"message":  "users found",
+			"data":     list,
+			"trace_id": spanCtx.TraceID().String(),
+			"span_id":  spanCtx.SpanID().String(),
 		})
 	})
 
-	// ... (outras rotas e log.Fatal(app.Listen(":3123")))
 	log.Fatal(app.Listen(":3123"))
 }

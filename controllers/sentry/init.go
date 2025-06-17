@@ -18,7 +18,7 @@ func (p *sentryGormPlugin) Initialize(db *gorm.DB) error {
 			"db.sql.query",
 			sentry.WithDescription(db.Dialector.Explain(db.Statement.SQL.String(), db.Statement.Vars...)),
 		)
-		db.InstanceSet("sentry:span", span) // guarda pra fechar depois
+		db.InstanceSet("sentry:span", span)
 	}
 
 	after := func(db *gorm.DB) {
